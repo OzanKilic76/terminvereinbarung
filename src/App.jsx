@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import './App.css'
-import { createTeamsAppointment, getCalendarEvents, getMicrosoftAccount, microsoftConfigured, signInMicrosoft } from './microsoft'
+import { bookingApiConfigured, createBooking, getAvailability } from './bookingApi'
 
 const weekdays = ['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So']
 const slots = ['09:00', '10:30', '12:00', '14:00', '15:30', '17:00']
@@ -24,23 +24,18 @@ function App() {
   const [selectedTime, setSelectedTime] = useState(null)
   const [submitted, setSubmitted] = useState(false)
   const [form, setForm] = useState({ name: '', email: '', phone: '', comment: '' })
-  const [account, setAccount] = useState(null)
-  const [events, setEvents] = useState([])
-  const [isConnecting, setIsConnecting] = useState(false)
+  const [availableSlots, setAvailableSlots] = useState([])
   const [isBooking, setIsBooking] = useState(false)
   const [error, setError] = useState('')
   const [meetingUrl, setMeetingUrl] = useState('')
 
   useEffect(() => {
-    getMicrosoftAccount().then(setAccount).catch((requestError) => setError(requestError.message))
-  }, [])
-
-  useEffect(() => {
-    if (!account) return
-    const start = new Date(month.getFullYear(), month.getMonth(), 1)
-    const end = new Date(month.getFullYear(), month.getMonth() + 1, 0, 23, 59, 59)
-    getCalendarEvents(start, end).then(setEvents).catch((requestError) => setError(requestError.message))
-  }, [account, month])
+    if (!bookingApiConfigured) return
+    setError('')
+    getAvailability(`${month.getFullYear()}-${String(month.getMonth() + 1).padStart(2, '0')}`)
+      .then((data) => setAvailableSlots(data.slots || []))
+      .catch((requestError) => setError(requestError.message))
+  }, [month])
 
   const calendarDays = useMemo(() => {
     const first = new Date(month.getFullYear(), month.getMonth(), 1)
@@ -53,47 +48,26 @@ function App() {
   }, [month])
 
   const isSlotAvailable = (date, time) => {
-    if (!account || !date) return false
-    const [hours, minutes] = time.split(':').map(Number)
-    const start = new Date(date)
-    start.setHours(hours, minutes, 0, 0)
-    const end = new Date(start.getTime() + 60 * 60 * 1000)
-    return !events.some((event) => {
-      if (event.showAs === 'free' || !event.start?.dateTime || !event.end?.dateTime) return false
-      const eventStart = parseGraphDateTime(event.start.dateTime)
-      const eventEnd = parseGraphDateTime(event.end.dateTime)
-      return eventStart < end && eventEnd > start
-    })
+    if (!date) return false
+    return availableSlots.some((slot) => slot.date === dateKey(date) && slot.time === time)
   }
-  const isAvailable = (date) => date && (date.getDay() === 1 || date.getDay() === 5) && date >= today && slots.some((time) => isSlotAvailable(date, time))
+  const isAvailable = (date) => date && date >= today && slots.some((time) => isSlotAvailable(date, time))
   const selectDate = (date) => {
     if (!isAvailable(date)) return
     setSelectedDate(date)
     setSelectedTime(null)
     setSubmitted(false)
   }
-  const appointmentReady = selectedDate && selectedTime && form.name.trim() && form.email.trim()
-
-  const connectMicrosoft = async () => {
-    setIsConnecting(true)
-    setError('')
-    try {
-      setAccount(await signInMicrosoft())
-    } catch (requestError) {
-      setError(requestError.message)
-    } finally {
-      setIsConnecting(false)
-    }
-  }
+  const appointmentReady = selectedDate && selectedTime && form.name.trim() && form.email.trim() && form.phone.trim()
 
   const submitAppointment = async (event) => {
     event.preventDefault()
-    if (!appointmentReady || !account) return
+    if (!appointmentReady) return
     setIsBooking(true)
     setError('')
     try {
-      const createdEvent = await createTeamsAppointment({ date: selectedDate, time: selectedTime, ...form })
-      setMeetingUrl(createdEvent?.onlineMeeting?.joinUrl || '')
+      const createdEvent = await createBooking({ date: dateKey(selectedDate), time: selectedTime, ...form })
+      setMeetingUrl(createdEvent.joinUrl || '')
       setSubmitted(true)
     } catch (requestError) {
       setError(requestError.message)
@@ -139,9 +113,9 @@ function App() {
               <h3>Wähle einen passenden Termin</h3>
               <p className="muted">Beratungsgespräche finden montags und freitags statt.</p>
             </div>
-            {account ? <span className="secure-badge">● Outlook verbunden</span> : <button type="button" className="connect-button" onClick={connectMicrosoft} disabled={isConnecting || !microsoftConfigured}>{isConnecting ? 'Verbinde...' : 'Mit Outlook verbinden'}</button>}
+            <span className={bookingApiConfigured ? 'secure-badge' : 'connect-button'}>{bookingApiConfigured ? '● Kalender live' : 'Kalender wird eingerichtet'}</span>
           </div>
-          {!microsoftConfigured && <p className="integration-hint">Microsoft Outlook ist noch nicht konfiguriert.</p>}
+          {!bookingApiConfigured && <p className="integration-hint">Die Kalenderverbindung wird noch eingerichtet.</p>}
           {error && <p className="integration-error">{error}</p>}
 
           {submitted ? (
@@ -190,10 +164,6 @@ function App() {
       </section>
     </main>
   )
-}
-
-function parseGraphDateTime(value) {
-  return new Date(value.replace(/\.(\d{3})\d+/, '.$1'))
 }
 
 export default App
