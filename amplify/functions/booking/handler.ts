@@ -1,16 +1,31 @@
 /// <reference types="node" />
 
-import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager'
+import { randomBytes, createHmac } from 'node:crypto'
+import { SecretsManagerClient, GetSecretValueCommand, PutSecretValueCommand } from '@aws-sdk/client-secrets-manager'
 
 const graphBase = 'https://graph.microsoft.com/v1.0'
 const secretClient = new SecretsManagerClient({})
-let cachedSecret: { tenantId: string; clientId: string; clientSecret: string } | null = null
+type SecretValues = {
+  tenantId: string
+  clientId: string
+  clientSecret: string
+  accessToken?: string
+  refreshToken?: string
+  tokenExpiresAt?: number
+}
+
+let cachedSecret: SecretValues | null = null
 
 type Slot = { date: string; time: string }
 
 export const handler = async (event: any) => {
   try {
-    if (event.httpMethod === 'GET') return response(200, await getAvailability(event.queryStringParameters?.month))
+    if (event.httpMethod === 'GET') {
+      const query = event.queryStringParameters || {}
+      if (query.action === 'connect') return redirect(await getAuthorizationUrl())
+      if (query.action === 'callback') return await handleOAuthCallback(query)
+      return response(200, await getAvailability(query.month))
+    }
     if (event.httpMethod === 'POST') return response(200, await createBooking(JSON.parse(event.body || '{}')))
     return response(405, { message: 'Method not allowed' })
   } catch (error) {
@@ -26,6 +41,46 @@ async function getAvailability(month?: string) {
   return { month: targetMonth, slots }
 }
 
+async function getAuthorizationUrl() {
+  const secret = await getSecret()
+  const state = createState(secret.clientSecret)
+  const params = new URLSearchParams({
+    client_id: secret.clientId,
+    response_type: 'code',
+    redirect_uri: process.env.OAUTH_REDIRECT_URI!,
+    response_mode: 'query',
+    scope: 'offline_access User.Read Calendars.ReadWrite',
+    state,
+  })
+  return {
+    authorizationUrl: `https://login.microsoftonline.com/${process.env.OAUTH_AUTHORITY}/oauth2/v2.0/authorize?${params}`,
+    message: 'Öffne authorizationUrl einmalig mit deinem Microsoft-Konto.',
+  }
+}
+
+async function handleOAuthCallback(query: Record<string, string>) {
+  if (!query.code || !query.state) return response(400, { message: 'OAuth-Code oder Status fehlt.' })
+  const secret = await getSecret()
+  if (!verifyState(query.state, secret.clientSecret)) return response(400, { message: 'Ungültiger oder abgelaufener OAuth-Status.' })
+
+  const tokenResponse = await fetch(`https://login.microsoftonline.com/${process.env.OAUTH_AUTHORITY}/oauth2/v2.0/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: secret.clientId,
+      client_secret: secret.clientSecret,
+      code: query.code,
+      redirect_uri: process.env.OAUTH_REDIRECT_URI!,
+      grant_type: 'authorization_code',
+      scope: 'offline_access User.Read Calendars.ReadWrite',
+    }),
+  })
+  if (!tokenResponse.ok) return response(502, { message: `Microsoft OAuth fehlgeschlagen: ${await tokenResponse.text()}` })
+  const tokens = await tokenResponse.json()
+  await saveSecret({ ...secret, accessToken: tokens.access_token, refreshToken: tokens.refresh_token, tokenExpiresAt: Date.now() + (tokens.expires_in * 1000) })
+  return response(200, { message: 'Outlook erfolgreich verbunden. Kunden benötigen keinen Microsoft-Login.' })
+}
+
 async function createBooking(input: any) {
   const { name, email, phone, comment, date, time } = input
   if (!name?.trim() || !email?.trim() || !phone?.trim() || !/^\d{4}-\d{2}-\d{2}$/.test(date || '') || !isAllowedTime(time)) {
@@ -38,7 +93,7 @@ async function createBooking(input: any) {
 
   const start = `${date}T${time}:00`
   const end = `${date}T${addHour(time)}:00`
-  const created = await graphRequest(`/users/${encodeURIComponent(process.env.CALENDAR_OWNER!)}/events`, {
+  const created = await graphRequest('/me/events', {
     method: 'POST',
     body: JSON.stringify({
       subject: `Beratungsgespräch – ${name.trim()}`,
@@ -63,7 +118,7 @@ async function getCalendarView(month: string) {
   const lastDay = new Date(Date.UTC(year, monthNumber, 0)).getUTCDate()
   const end = `${month}-${String(lastDay).padStart(2, '0')}T23:59:59`
   const params = new URLSearchParams({ startDateTime: start, endDateTime: end, '$select': 'start,end,showAs', '$top': '500' })
-  const data = await graphRequest(`/users/${encodeURIComponent(process.env.CALENDAR_OWNER!)}/calendarView?${params}`, {
+  const data = await graphRequest(`/me/calendarView?${params}`, {
     headers: { Prefer: 'outlook.timezone="W. Europe Standard Time"' },
   })
   return data.value || []
@@ -81,19 +136,61 @@ async function graphRequest(path: string, options: RequestInit = {}) {
 
 async function getGraphToken() {
   const secret = await getSecret()
-  const body = new URLSearchParams({
-    client_id: secret.clientId,
-    client_secret: secret.clientSecret,
-    scope: 'https://graph.microsoft.com/.default',
-    grant_type: 'client_credentials',
-  })
-  const result = await fetch(`https://login.microsoftonline.com/${secret.tenantId}/oauth2/v2.0/token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body,
-  })
-  if (!result.ok) throw new Error(`Microsoft token request failed: ${result.status}`)
-  return (await result.json()).access_token
+  if (secret.refreshToken) {
+    if (secret.accessToken && secret.tokenExpiresAt && secret.tokenExpiresAt > Date.now() + 60_000) return secret.accessToken
+    const result = await fetch(`https://login.microsoftonline.com/${process.env.OAUTH_AUTHORITY}/oauth2/v2.0/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: secret.clientId,
+        client_secret: secret.clientSecret,
+        refresh_token: secret.refreshToken,
+        scope: 'offline_access User.Read Calendars.ReadWrite',
+        grant_type: 'refresh_token',
+      }),
+    })
+    if (!result.ok) throw new Error(`Microsoft token refresh failed: ${result.status}`)
+    const tokens = await result.json()
+    await saveSecret({ ...secret, accessToken: tokens.access_token, refreshToken: tokens.refresh_token || secret.refreshToken, tokenExpiresAt: Date.now() + (tokens.expires_in * 1000) })
+    return tokens.access_token
+  }
+  throw new Error('Outlook ist noch nicht verbunden. Öffne zuerst die Connect-URL für den Administrator.')
+}
+
+async function saveSecret(value: SecretValues) {
+  await secretClient.send(new PutSecretValueCommand({
+    SecretId: process.env.AZURE_SECRET_NAME,
+    SecretString: JSON.stringify(value),
+  }))
+  cachedSecret = value
+}
+
+function redirect(data: { authorizationUrl: string }) {
+  return {
+    statusCode: 302,
+    headers: { Location: data.authorizationUrl, 'Cache-Control': 'no-store' },
+    body: '',
+  }
+}
+
+function createState(clientSecret: string) {
+  const payload = `${Date.now()}.${randomBytes(24).toString('hex')}`
+  const signature = createHmac('sha256', clientSecret).update(payload).digest('hex')
+  return Buffer.from(`${payload}.${signature}`).toString('base64url')
+}
+
+function verifyState(state: string, clientSecret: string) {
+  try {
+    const decoded = Buffer.from(state, 'base64url').toString()
+    const parts = decoded.split('.')
+    const signature = parts.pop()
+    const payload = parts.join('.')
+    if (!signature || !payload || Date.now() - Number(payload.split('.')[0]) > 10 * 60 * 1000) return false
+    const expected = createHmac('sha256', clientSecret).update(payload).digest('hex')
+    return signature === expected
+  } catch {
+    return false
+  }
 }
 
 async function getSecret() {

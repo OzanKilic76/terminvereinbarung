@@ -7,6 +7,7 @@ const backend = defineBackend({ booking })
 const apiStack = backend.createStack('BookingApiStack')
 const secret = Secret.fromSecretNameV2(apiStack, 'AzureSecret', 'AzureSecretTerminvereinbarung')
 secret.grantRead(backend.booking.resources.lambda)
+secret.grantWrite(backend.booking.resources.lambda)
 
 const api = new RestApi(apiStack, 'BookingApi', {
   restApiName: 'terminvereinbarung-api',
@@ -19,6 +20,7 @@ const api = new RestApi(apiStack, 'BookingApi', {
 const bookingResource = api.root.addResource('booking')
 bookingResource.addMethod('GET', new LambdaIntegration(backend.booking.resources.lambda))
 bookingResource.addMethod('POST', new LambdaIntegration(backend.booking.resources.lambda))
+backend.booking.addEnvironment('OAUTH_REDIRECT_URI', api.urlForPath('/booking'))
 
 backend.addOutput({
   custom: {
